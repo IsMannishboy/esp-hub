@@ -1,0 +1,260 @@
+#include <Arduino.h>
+#include <unordered_map>
+#include <vector>
+#include "driver/gpio.h"
+
+#ifndef HD_PIN
+#define HD_PIN 4                     // single-wire half-duplex pin
+#endif
+
+class Port;
+
+// Routing table: packet type -> every port that wants it.
+// A port is skipped by pointer (p == this), so it never gets its own packets back.
+std::unordered_map<uint8_t, std::vector<Port*>> routes;
+
+void subscribe(uint8_t type, Port *p)
+{
+    routes[type].push_back(p);
+}
+
+// CRSF CRC8: poly 0xD5, init 0x00, over [type .. last payload byte]
+uint8_t crc8(const uint8_t *data, uint8_t len){
+    uint8_t crc = 0;
+    for (uint8_t i = 0; i < len; i++) {
+        crc ^= data[i];
+        for (uint8_t b = 0; b < 8; b++) {
+            crc = (crc & 0x80) ? (uint8_t)((crc << 1) ^ 0xD5) : (uint8_t)(crc << 1);
+        }
+    }
+    return crc;
+}
+
+class Port{
+    public:
+    Port(HardwareSerial * serial){
+        this->Serial = serial;
+        clear_params();
+    };
+    virtual ~Port() {}
+
+    void clear_params(){
+        counter = 0;
+        len = 0;
+        addr_is_parsed = false;
+        len_is_parsed = false;
+        type_is_parsed = false;
+        ready = false;
+        valid = false;
+        is_not_completed = false;
+        memset(buff, 0, sizeof(buff));
+    };
+
+    uint8_t buff[256];
+    uint8_t counter = 0;
+    int len = 0;
+    bool type_is_parsed = false;
+    bool addr_is_parsed = false;
+    bool len_is_parsed = false;
+    bool ready = false;
+    bool valid = false;
+    bool is_not_completed = false;
+    bool frame_done = false;         // a whole valid frame was received in this input_handler() call
+    HardwareSerial *Serial;
+
+    void drain(){
+        while (this->Serial->available())
+        {
+            this->Serial->read();
+        }
+    }
+
+    // send the current frame to every subscriber of its type, except ourselves
+    void send(){
+        auto it = routes.find(buff[2]);
+        if (it == routes.end()) {
+            return;
+        }
+        for (Port *p : it->second) {
+            if (p == this) {
+                continue;
+            }
+            p->output_handler(buff, len);
+        }
+    }
+
+    // frame fully received: check CRC, route it, get ready for the next one
+    void finish_frame(){
+        ready = true;
+        valid = crc8(buff + 2, len - 3) == buff[len - 1];
+        if (valid) {
+            send();
+            frame_done = true;
+        }
+        clear_params();              // valid or not: start over with the next address
+    }
+
+    void complete_packet(){
+        while (counter < len && this->Serial->available())
+        {
+            buff[counter] = this->Serial->read();
+            counter++;
+        }
+        is_not_completed = (counter < len);
+    };
+
+    virtual void input_handler(){
+        frame_done = false;
+
+        // finish a frame that was cut off in the previous call
+        if(is_not_completed){
+            complete_packet();
+            if(is_not_completed){
+                return;
+            }
+            finish_frame();
+        }
+
+        while (this->Serial->available())
+        {
+            uint8_t byte = this->Serial->read();
+
+            // addr
+            if(counter == 0){
+                if(byte == 0xC8 || byte == 0xEE || byte == 0xEA){
+                    buff[counter] = byte;
+                    counter++;
+                    addr_is_parsed = true;
+                }
+                continue;            // not an address: skip, keep searching
+            }
+
+            // len = type + payload + crc
+            if(counter == 1){
+                if(byte < 2 || byte > 62){
+                    clear_params();  // garbage: search the next address
+                }else{
+                    len = byte + 2;  // whole frame
+                    buff[counter] = byte;
+                    counter++;
+                    len_is_parsed = true;
+                }
+                continue;
+            }
+
+            // type: accept only types somebody subscribed to
+            if(counter == 2){
+                if(routes.find(byte) == routes.end()){
+                    clear_params();
+                    continue;
+                }
+                buff[counter] = byte;
+                counter++;
+                type_is_parsed = true;
+                continue;            // len >= 4, so the frame always goes on
+            }
+
+            // payload + crc
+            if(addr_is_parsed && len_is_parsed && type_is_parsed){
+                buff[counter] = byte;
+                counter++;
+                complete_packet();
+                if(is_not_completed){
+                    return;          // rest of the frame comes in the next call
+                }
+                finish_frame();
+            }
+        }
+    };
+
+    virtual void output_handler(const uint8_t *data, int n){
+        this->Serial->write(data, n);
+    };
+};
+
+// Single-wire half-duplex port (open-drain, non-inverted line, external pull-up advised).
+// Packets for it are queued and sent one per reply slot: right after a whole frame from
+// the other side, while the line is quiet. Our own bytes come back as echo and are skipped.
+class HD : public Port{
+    public:
+    HD(HardwareSerial *serial) : Port(serial) {}
+
+    static const int TXQ = 6;
+    uint8_t txq[TXQ][64];
+    uint8_t txq_len[TXQ] = {0};
+    int txq_head = 0;
+    int txq_count = 0;
+
+    int echo_skip = 0;               // own bytes still to come back on RX
+    uint32_t echo_since = 0;
+
+    void output_handler(const uint8_t *data, int n) override{
+        if (n > 64) {
+            return;
+        }
+        if (txq_count == TXQ) {      // nobody drains the queue: drop the oldest
+            txq_head = (txq_head + 1) % TXQ;
+            txq_count--;
+        }
+        int slot = (txq_head + txq_count) % TXQ;
+        memcpy(txq[slot], data, n);
+        txq_len[slot] = n;
+        txq_count++;
+    }
+
+    void input_handler() override{
+        // 1. swallow the echo of what we sent last time
+        while (echo_skip > 0 && Serial->available()) {
+            Serial->read();
+            echo_skip--;
+        }
+        if (echo_skip > 0) {
+            if (millis() - echo_since > 5) {
+                echo_skip = 0;       // echo lost: don't hang
+            } else {
+                return;
+            }
+        }
+
+        // 2. normal parsing
+        Port::input_handler();
+
+        // 3. reply slot: a whole frame just ended and nothing follows it yet
+        if (frame_done && counter == 0 && Serial->available() == 0 && txq_count > 0) {
+            Serial->write(txq[txq_head], txq_len[txq_head]);
+            Serial->flush();         // wait for the last stop bit
+            echo_skip = txq_len[txq_head];
+            echo_since = millis();
+            txq_head = (txq_head + 1) % TXQ;
+            txq_count--;
+        }
+    }
+};
+
+Port fd(&Serial1);
+HD   hd(&Serial2);
+
+void setup(){
+    // full duplex: RX=19, TX=18
+    Serial1.begin(115200, SERIAL_8N1, 19, 18, false);
+
+    // half duplex: RX and TX on one open-drain pin
+    Serial2.begin(420000, SERIAL_8N1, HD_PIN, HD_PIN, false);
+    gpio_set_direction((gpio_num_t)HD_PIN, GPIO_MODE_INPUT_OUTPUT_OD);
+    gpio_set_pull_mode((gpio_num_t)HD_PIN, GPIO_PULLUP_ONLY);
+
+    // begin() is done only now, so drain here, not in the constructor
+    fd.drain();
+    hd.drain();
+
+    // who gets which packet type (a port never gets its own packets back)
+    subscribe(0x16, &fd);            // RC channels
+    subscribe(0x16, &hd);
+    subscribe(0x54, &fd);            // WS / Lua
+    subscribe(0x55, &hd);            // replies -> radio
+}
+
+void loop(){
+    fd.input_handler();
+    hd.input_handler();
+}

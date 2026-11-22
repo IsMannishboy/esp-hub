@@ -1,0 +1,52 @@
+{
+    "chip":"esp32",
+    "IN1":{
+        "BAUD":115200,
+        "INV":true,
+        "PORT_TYPE":"FD",
+        "PACKET_TYPES":{
+            "CRSF":0,
+            "WS":1
+
+        },
+        "RX":20,
+        "TX":10
+        
+
+    },
+    "IN2":{
+       "BAUD":115200,
+        "INV":true,
+        "PORT_TYPE":"HD",
+        "PACKET_TYPES":{
+            "CRSF":0,
+            "WS":1
+
+        },
+        "RX":19
+    },
+    "OUT1":{
+        "BAUD":420000,
+        "INV":false,
+        "PORT_TYPE":"FD",
+        "PACKET_TYPES":{
+            "CRSF":0,
+            "WS":1
+
+        },
+        "RX":17
+
+    },
+    "OUT2":{
+        "BAUD":1000000,
+        "INV":true,
+        "PORT_TYPE":"SBUS",
+        "PACKET_TYPES":{
+            "CRSF":0,
+            "WS":1
+
+        },
+        "RX":16
+
+    }
+}

@@ -1,0 +1,37 @@
+{
+    "chip": "esp32",
+    "log": false,
+    "led_pin": 2,
+    "ports": [
+        {
+            "name": "radio",
+            "mode": "HD",
+            "uart": 1,
+            "pin": 19,
+            "baud": 115200,
+            "cfg": "8N1",
+            "inv": true,
+            "rx": ["RC", "WS"],
+            "tx": ["WS_REPLY"]
+        },
+        {
+            "name": "vrx",
+            "mode": "FD",
+            "uart": 2,
+            "rx_pin": 16,
+            "tx_pin": 17,
+            "baud": 420000,
+            "cfg": "8N1",
+            "inv": false,
+            "rx": ["WS_REPLY"],
+            "tx": ["RC", "WS"]
+        },
+        {
+            "name": "sbus",
+            "mode": "SBUS",
+            "uart": 0,
+            "tx_pin": 4,
+            "tx": ["RC"]
+        }
+    ]
+}
